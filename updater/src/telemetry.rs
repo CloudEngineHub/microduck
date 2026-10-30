@@ -155,21 +155,32 @@ impl Telemetry {
         if let Some(from) = previous.filter(|v| v != VERSION) {
             self.capture(
                 "update_result",
-                json!({ "from_version": from, "to_version": VERSION, "success": true }),
+                // No `success`: a start cannot tell an update from a rollback or a `select`. A
+                // downgrade in from/to is what a rollback looks like.
+                json!({ "from_version": from, "to_version": VERSION }),
             );
         }
     }
 
-    /// `policies` once a run, the first time `robotd` answers, naming what every slot runs; then
-    /// `policy_loaded` for each slot whose policy changed since the last answer.
+    /// `policies` once per robot id, the first time `robotd` answers, naming what every slot runs;
+    /// then `policy_loaded` for each slot whose policy changed since the last answer.
     async fn watch_policies(
         &self,
         robot_socket: &Path,
-        last: &mut Option<serde_json::Map<String, Value>>,
+        last: &mut Option<(String, serde_json::Map<String, Value>)>,
     ) {
-        if !active(&self.lock().state) {
-            return;
-        }
+        let id = {
+            let inner = self.lock();
+            match inner
+                .state
+                .robot_id
+                .clone()
+                .filter(|_| active(&inner.state))
+            {
+                Some(id) => id,
+                None => return,
+            }
+        };
         let Some(answer) = crate::robot::ask_socket(
             robot_socket,
             &proto::Call::RobotPolicies,
@@ -188,30 +199,29 @@ impl Telemetry {
             .filter(|_| result.enabled)
             .filter_map(|s| Some((format!("policy_{}", s.slot), policy_id(s)?.into())))
             .collect();
-        match last {
+        // A new id — off, then on again within a run — gets its own snapshot.
+        match last.take().filter(|(was, _)| *was == id) {
             None => {
                 let mut properties = now.clone();
                 properties.insert("mode".into(), result.mode.clone().into());
                 self.capture("policies", Value::Object(properties));
             }
-            Some(before) => {
-                for slot in result.slots.iter().filter(|_| result.enabled) {
-                    let key = format!("policy_{}", slot.slot);
-                    if let Some(policy) = now.get(&key).filter(|p| before.get(&key) != Some(*p)) {
-                        self.capture(
-                            "policy_loaded",
-                            json!({
-                                "slot": slot.slot,
-                                "mode": result.mode,
-                                "origin": slot.origin,
-                                "policy": policy,
-                            }),
-                        );
-                    }
+            Some((_, before)) => {
+                for key in changed(&before, &now) {
+                    let slot = key.trim_start_matches("policy_");
+                    let origin = result
+                        .slots
+                        .iter()
+                        .find(|s| s.slot == slot)
+                        .map(|s| &s.origin);
+                    self.capture(
+                        "policy_loaded",
+                        json!({ "slot": slot, "mode": result.mode, "origin": origin, "policy": now[key] }),
+                    );
                 }
             }
         }
-        *last = Some(now);
+        *last = Some((id, now));
     }
 
     fn capture(&self, event: &str, properties: Value) {
@@ -321,6 +331,18 @@ fn result(state: &State) -> proto::TelemetryResult {
 
 fn active(state: &State) -> bool {
     state.enabled && !blocked_by_env()
+}
+
+/// The `policy_<slot>` keys whose policy is new or different in `now`. A slot that emptied is not
+/// a load, so it is not among them.
+fn changed<'a>(
+    before: &serde_json::Map<String, Value>,
+    now: &'a serde_json::Map<String, Value>,
+) -> Vec<&'a str> {
+    now.iter()
+        .filter(|(key, policy)| before.get(*key) != Some(*policy))
+        .map(|(key, _)| key.as_str())
+        .collect()
 }
 
 /// What a slot runs, as telemetry may name it: `org/name@revision/file` for a policy from the
@@ -448,6 +470,51 @@ mod tests {
         assert!(
             t.lock().queue.is_empty(),
             "off drops the queue and queues nothing more"
+        );
+    }
+
+    #[test]
+    fn only_a_slot_whose_policy_changed_is_reported() {
+        let slots = |pairs: &[(&str, &str)]| -> serde_json::Map<String, Value> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), json!(v)))
+                .collect()
+        };
+        let before = slots(&[
+            ("policy_walk", "a@v8/walk.onnx"),
+            ("policy_stand", "a@v8/stand.onnx"),
+        ]);
+
+        assert!(
+            changed(&before, &before).is_empty(),
+            "the same answer is no event"
+        );
+        assert_eq!(
+            changed(
+                &before,
+                &slots(&[
+                    ("policy_walk", "b@main/walk.onnx"),
+                    ("policy_stand", "a@v8/stand.onnx")
+                ])
+            ),
+            vec!["policy_walk"],
+        );
+        assert_eq!(
+            changed(
+                &before,
+                &slots(&[
+                    ("policy_walk", "a@v8/walk.onnx"),
+                    ("policy_stand", "a@v8/stand.onnx"),
+                    ("policy_kick", "local")
+                ])
+            ),
+            vec!["policy_kick"],
+            "a slot filled for the first time is a load"
+        );
+        assert!(
+            changed(&before, &slots(&[("policy_walk", "a@v8/walk.onnx")])).is_empty(),
+            "a slot that emptied is not"
         );
     }
 
