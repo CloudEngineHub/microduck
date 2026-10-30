@@ -251,7 +251,10 @@ impl Telemetry {
             .send()
             .await;
         let retry = match sent {
-            Ok(response) if response.status().is_success() => false,
+            Ok(response) if response.status().is_success() => {
+                tracing::debug!(events = batch.len(), "telemetry sent");
+                false
+            }
             Ok(response) => {
                 let status = response.status();
                 let retry = status.as_u16() == 429 || status.is_server_error();
@@ -379,7 +382,9 @@ fn new_id() -> Result<String, Error> {
 fn envelope() -> Value {
     json!({
         "daemon_version": VERSION,
-        "os_version": os_version(),
+        "os_version": format!("{} {}", os_release("ID"), os_release("VERSION_ID")).trim(),
+        // The image build: `VERSION_ID` is Yocto's release, the same on every image built from it.
+        "os_build": os_release("BUILD_ID"),
         "board": robotd_params::board::Board::detected().map_or("unknown", |b| b.label()),
         "arch": std::env::consts::ARCH,
         "$geoip_disable": true,
@@ -387,19 +392,14 @@ fn envelope() -> Value {
     })
 }
 
-/// `ID VERSION_ID` from os-release: the image version on a microduck_os board.
-fn os_version() -> String {
-    let release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-    let field = |key: &str| {
-        release
-            .lines()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
-            .map(|v| v.trim_matches('"').to_owned())
-            .unwrap_or_default()
-    };
-    format!("{} {}", field("ID"), field("VERSION_ID"))
-        .trim()
-        .to_owned()
+/// One field of `/etc/os-release`, or empty.
+fn os_release(key: &str) -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+        .map(|v| v.trim_matches('"').to_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

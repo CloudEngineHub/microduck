@@ -10,7 +10,7 @@ Every event carries:
 
 - a random robot id, created when telemetry is turned on and deleted when it is turned off
 - the board (`zero3`, `beta`, or `unknown`), the CPU architecture
-- the daemon version, and the OS image (`ID VERSION_ID` from `/etc/os-release`)
+- the daemon version, and the OS image: `ID VERSION_ID` and its `BUILD_ID` from `/etc/os-release`
 
 | Event | When | Extra data |
 |---|---|---|
