@@ -17,6 +17,12 @@ Every event carries:
 | `daemon_started` | `updaterd` starts: each boot and each daemon update | — |
 | `update_result` | the first start on a new daemon version | previous and new version |
 | `daily_heartbeat` | once a day | `updaterd`'s uptime |
+| `policies` | once a run, when `robotd` first answers | the mode, and `policy_<slot>` for every filled slot |
+| `policy_loaded` | a slot's policy changed (checked every minute) | slot, mode, origin, policy |
+
+A policy is named `org/name@revision/file` when it came from the Hugging Face Hub — the official
+set or `policy.fetch`, both of which download without a token, so the repo was public when the
+robot got it. A file put on the robot by hand is only ever `local`: its path is not sent.
 
 ## What is never sent
 
@@ -44,7 +50,8 @@ robot id; turning it back on starts a new id that nothing links to the old one.
 
 `telemetry.status` answers `enabled` (the stored choice) and `active` (whether anything is actually
 sent). `MICRODUCK_TELEMETRY=0` or `DO_NOT_TRACK=1` in `updaterd`'s environment forces it off
-whatever the choice; `scripts/duck-sim` sets the first, so a simulated duck sends nothing.
+whatever the choice; `scripts/duck-sim` and `scripts/systemd-test.sh` set the first, so a simulated
+or containerised duck sends nothing.
 
 The choice lives in `/var/lib/robot/updater/telemetry.json`. A file that cannot be read means off.
 

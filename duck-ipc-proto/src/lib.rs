@@ -3066,8 +3066,8 @@ pub struct TelemetrySetParams {
 pub struct TelemetryResult {
     /// The owner's choice, as stored.
     pub enabled: bool,
-    /// Whether anything is actually sent: `enabled`, no `MICRODUCK_TELEMETRY=0` or
-    /// `DO_NOT_TRACK=1` in `updaterd`'s environment, and a build that has a PostHog key.
+    /// Whether anything is actually sent: `enabled`, and no `MICRODUCK_TELEMETRY=0` or
+    /// `DO_NOT_TRACK=1` in `updaterd`'s environment.
     pub active: bool,
 }
 

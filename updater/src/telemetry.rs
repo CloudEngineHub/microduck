@@ -24,9 +24,8 @@ use crate::{Error, proto};
 pub const DEFAULT_PATH: &str = "/var/lib/robot/updater/telemetry.json";
 
 const POSTHOG_URL: &str = "https://eu.i.posthog.com/batch/";
-/// Public, write-only project key.
-// shortcut: empty until the microduck PostHog project exists, and nothing is sent while it is.
-const POSTHOG_KEY: &str = "";
+/// Public, write-only project key of the microduck project.
+const POSTHOG_KEY: &str = "phc_CHtC7Bhn9RUnx9y7qGBaFjXNvgqidxvd57W9Y3cFSaWk";
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(24 * 3600);
@@ -97,8 +96,9 @@ impl Telemetry {
         Ok(result(&inner.state))
     }
 
-    /// Report this start, then flush the queue every minute and send a heartbeat once a day.
-    pub async fn run(self: Arc<Self>) {
+    /// Report this start, then every minute note what the policy slots run and flush the queue,
+    /// and send a heartbeat once a day.
+    pub async fn run(self: Arc<Self>, robot_socket: PathBuf) {
         self.started();
         let client = match crate::source::http::client() {
             Ok(client) => client,
@@ -111,9 +111,13 @@ impl Telemetry {
         let mut flush = tokio::time::interval(FLUSH_INTERVAL);
         let mut heartbeat =
             tokio::time::interval_at(since + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+        let mut policies = None;
         loop {
             tokio::select! {
-                _ = flush.tick() => self.flush(&client).await,
+                _ = flush.tick() => {
+                    self.watch_policies(&robot_socket, &mut policies).await;
+                    self.flush(&client).await;
+                }
                 _ = heartbeat.tick() => self.capture(
                     "daily_heartbeat",
                     json!({ "uptime_s": since.elapsed().as_secs() }),
@@ -154,6 +158,60 @@ impl Telemetry {
                 json!({ "from_version": from, "to_version": VERSION, "success": true }),
             );
         }
+    }
+
+    /// `policies` once a run, the first time `robotd` answers, naming what every slot runs; then
+    /// `policy_loaded` for each slot whose policy changed since the last answer.
+    async fn watch_policies(
+        &self,
+        robot_socket: &Path,
+        last: &mut Option<serde_json::Map<String, Value>>,
+    ) {
+        if !active(&self.lock().state) {
+            return;
+        }
+        let Some(answer) = crate::robot::ask_socket(
+            robot_socket,
+            &proto::Call::RobotPolicies,
+            Duration::from_secs(2),
+        )
+        .await
+        else {
+            return;
+        };
+        let Ok(result) = serde_json::from_value::<proto::PoliciesResult>(answer) else {
+            return;
+        };
+        let now: serde_json::Map<String, Value> = result
+            .slots
+            .iter()
+            .filter(|_| result.enabled)
+            .filter_map(|s| Some((format!("policy_{}", s.slot), policy_id(s)?.into())))
+            .collect();
+        match last {
+            None => {
+                let mut properties = now.clone();
+                properties.insert("mode".into(), result.mode.clone().into());
+                self.capture("policies", Value::Object(properties));
+            }
+            Some(before) => {
+                for slot in result.slots.iter().filter(|_| result.enabled) {
+                    let key = format!("policy_{}", slot.slot);
+                    if let Some(policy) = now.get(&key).filter(|p| before.get(&key) != Some(*p)) {
+                        self.capture(
+                            "policy_loaded",
+                            json!({
+                                "slot": slot.slot,
+                                "mode": result.mode,
+                                "origin": slot.origin,
+                                "policy": policy,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        *last = Some(now);
     }
 
     fn capture(&self, event: &str, properties: Value) {
@@ -258,7 +316,36 @@ fn result(state: &State) -> proto::TelemetryResult {
 }
 
 fn active(state: &State) -> bool {
-    state.enabled && !POSTHOG_KEY.is_empty() && !blocked_by_env()
+    state.enabled && !blocked_by_env()
+}
+
+/// What a slot runs, as telemetry may name it: `org/name@revision/file` for a policy from the
+/// Hub — public, since both the official set and `policy.fetch` download without a token — and
+/// only `local` for a file put on the robot by hand, whose path could say anything. `None` for an
+/// empty slot.
+fn policy_id(slot: &proto::PolicySlot) -> Option<String> {
+    policy_id_at(
+        Path::new(slot.path.as_deref()?),
+        crate::policy::installed(Path::new(crate::policy::POLICY_ROOT)),
+    )
+}
+
+fn policy_id_at(path: &Path, official: Option<crate::policy::Source>) -> Option<String> {
+    let file = path.file_name()?.to_string_lossy();
+    if path.starts_with(robotd_params::POLICY_DIR) {
+        return Some(match official {
+            Some(set) => format!("{}@{}/{file}", set.repo, set.version),
+            None => format!("official/{file}"),
+        });
+    }
+    // `<library>/<org>/<name>/<revision>/<file>`, laid out by `policy::fetch`.
+    if let Ok(rest) = path.strip_prefix(crate::policy::LIBRARY_ROOT) {
+        let parts: Vec<_> = rest.iter().map(|c| c.to_string_lossy()).collect();
+        if let [org, name, revision, _] = parts.as_slice() {
+            return Some(format!("{org}/{name}@{revision}/{file}"));
+        }
+    }
+    Some("local".into())
 }
 
 fn blocked_by_env() -> bool {
@@ -349,12 +436,35 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_queued_without_a_key() {
+    fn nothing_is_queued_while_off() {
         let dir = tempfile::tempdir().unwrap();
         let t = at(&dir);
         t.set(true).unwrap();
         t.capture("daemon_started", json!({}));
-        assert_eq!(t.lock().queue.len(), usize::from(!POSTHOG_KEY.is_empty()));
-        assert!(!t.status().active || !POSTHOG_KEY.is_empty());
+        assert_eq!(t.lock().queue.len(), 1);
+        t.set(false).unwrap();
+        t.capture("daemon_started", json!({}));
+        assert!(
+            t.lock().queue.is_empty(),
+            "off drops the queue and queues nothing more"
+        );
+    }
+
+    #[test]
+    fn a_policy_is_named_by_its_hub_repo_and_a_hand_placed_one_is_not() {
+        let set = crate::policy::Source {
+            repo: "pollen-robotics/microduck-policies".into(),
+            version: "v8".into(),
+        };
+        let id = |p: &str| policy_id_at(Path::new(p), Some(set.clone())).unwrap();
+        assert_eq!(
+            id("/opt/robot/policies/current/walk.onnx"),
+            "pollen-robotics/microduck-policies@v8/walk.onnx"
+        );
+        assert_eq!(
+            id("/var/lib/robot/policies/RemiFabre/microduck-flamingo/main/policy.onnx"),
+            "RemiFabre/microduck-flamingo@main/policy.onnx"
+        );
+        assert_eq!(id("/home/fabien/secret-project/walk.onnx"), "local");
     }
 }

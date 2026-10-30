@@ -330,7 +330,7 @@ impl Server {
     /// Report this start and send usage data until the process ends. Nothing leaves the robot
     /// while the owner's switch is off; see [`crate::telemetry`].
     pub fn spawn_telemetry(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(Arc::clone(&self.telemetry).run())
+        tokio::spawn(Arc::clone(&self.telemetry).run(self.vetbook.robot_socket.clone()))
     }
 
     /// One pass of the scheduler. Exposed so tests can drive it without waiting for
