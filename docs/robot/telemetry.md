@@ -32,8 +32,10 @@ serial or any hardware id, logs, camera images or audio.
 ## Where it goes
 
 [PostHog](https://posthog.com) EU Cloud (servers in the European Union), with IP-based location
-disabled and no person profiles. Events carry no timestamp of their own: the board has no RTC, so
-PostHog stamps them on arrival. Events wait in memory, at most 500, while the robot is offline.
+disabled and no person profiles. Events carry no timestamp of their own: the board's RTC has no
+battery and resets on a hard power-off, so until NTP syncs the clock is wrong, and PostHog stamps
+them on arrival. Events wait in memory, at most 500, while the robot is offline or not yet synced —
+TLS cannot validate a certificate before then either.
 
 ## Turning it off
 

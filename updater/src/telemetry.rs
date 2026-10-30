@@ -231,8 +231,9 @@ impl Telemetry {
         if inner.queue.len() >= MAX_QUEUE {
             inner.queue.pop_front();
         }
-        // No `timestamp`: the board has no RTC, so before NTP its clock is wrong, and PostHog
-        // stamps an event with the time it arrives instead. A queued event is late by its wait.
+        // No `timestamp`: the RTC has no battery and resets on a hard power-off, so before NTP
+        // the clock is wrong. PostHog stamps an event with the time it arrives instead; a queued
+        // event is late by its wait.
         inner
             .queue
             .push_back(json!({ "event": event, "distinct_id": id, "properties": merged }));
